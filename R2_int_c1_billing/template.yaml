@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: "AWS::Serverless-2016-10-31"
+Description: Billing File Processor Stack
+
+Globals:
+  Function:
+    Tracing: Active
+    Timeout: 300
+    Runtime: python3.13
+
+Parameters:
+  AccountPrefix:
+    Description: Account Name as Prefix
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /account/name
+  EnvPrefix:
+    Type: String
+    Description: Environment Name as Prefix
+    Default: myenvironment
+
+  ProjPrefix:
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: resource prfix, swmi
+    Default: ProjPrefix
+
+Resources:
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: s3.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: ReplicationPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetReplicationConfiguration
+            - s3:ListBucket
+            Resource:
+            - !Sub "arn:aws:s3:::seil-${EnvPrefix}-billing"
+          - Effect: Allow
+            Action:
+            - s3:GetObjectVersionForReplication
+            - s3:GetObjectVersion
+            - s3:GetObjectVersionAcl
+            - s3:GetObjectVersionTagging
+            Resource:
+            - !Sub "arn:aws:s3:::seil-${EnvPrefix}-billing/*"
+          - Effect: Allow
+            Action:
+            - s3:ReplicateObject
+            - s3:ReplicateDelete
+            - s3:ReplicateTags
+            Resource:
+            - !Sub "arn:aws:s3:::seil-${EnvPrefix}-billing-replication/*"
+
+  BillingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: "Retain"
+    UpdateReplacePolicy: "Retain"
+    Properties:
+      BucketName: !Sub "seil-${EnvPrefix}-billing"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+        - Id: ArchiveAndDeleteRule
+          Status: Enabled
+          Transitions:
+          - TransitionInDays: 0
+            StorageClass: INTELLIGENT_TIERING
+          - TransitionInDays: 30 # Archive to Glacier after 30 days
+            StorageClass: GLACIER
+          - TransitionInDays: 180 # Archive to DEEP_ARCHIVE after 180  days
+            StorageClass: DEEP_ARCHIVE
+          ExpirationInDays: 2560
+      ReplicationConfiguration:
+        Role: !GetAtt ReplicationRole.Arn
+        Rules:
+        - Id: "ReplicationRule"
+          Status: Enabled
+          Prefix: ""
+          Destination:
+            Bucket: !Sub "arn:aws:s3:::seil-${EnvPrefix}-billing-replication"
+
+  BillingFileProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/billing_file_processor
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      MemorySize: 4098
+      Architectures:
+      - x86_64
+      Timeout: 900
+
+      Environment:
+        Variables:
+          #LANDMARK_SFTP_PATH: !Sub '/${EnvPrefix}/d2_export/landmak/ftppath'
+          LANDMARK_SFTP_PATH: !Sub "/${EnvPrefix}/c1/lmk_ftppath"
+          ALLOWED_SCHEDULE_RANGE: !Sub "/${EnvPrefix}/c1/allowed_schedule_range"
+          SEIL_S3_BUCKET: !Ref BillingBucket
+          LANDMARK_SFTP_SECRET_NAME: !Sub "${EnvPrefix}/lmk_ftp"
+          LANDMARK_SFTP_SECRET_NAME_DELETE: !Sub "${EnvPrefix}/lmk_ftp_delete"
+          GA_SFTP_SECRET_NAME: !Sub "${EnvPrefix}/ga_ftp"
+          GA_FTP_PATH: !Sub "/${EnvPrefix}/c1/ga_ftp_path"
+          SQS_QUEUE_URL: !Ref BillingQueue
+          S3_KEY: s3-prefix/filename.ext
+
+      Policies:
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - secretsmanager:GetResourcePolicy
+          - secretsmanager:GetSecretValue
+          - secretsmanager:DescribeSecret
+          - secretsmanager:ListSecretVersionIds
+          Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - ssm:GetParameter
+          Resource: [ !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvPrefix}/*" ]
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:*
+          Resource: "*"
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - sqs:*
+          Resource: "*"
+
+      Events:
+        ScheduledC1EventV2:
+          Type: ScheduleV2
+          Properties:
+            Name: !Sub "${EnvPrefix}-c1-event"
+            Description: C1 daily scheduler
+            ScheduleExpression: "cron(0 5 * * ? *)"
+            ScheduleExpressionTimezone: "Australia/Sydney"
+            State: ENABLED
+
+  BillingQueueConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/billing_queue_consumer
+      Handler: c1_billing_queue_consumer.lambda_handler
+      Runtime: python3.13
+      Architectures:
+      - x86_64
+      Timeout: 900
+
+      Environment:
+        Variables:
+          LMK_QUEUE: !Sub "${EnvPrefix}_Billing_Queue"
+          BILLING_BUCKET: !Ref BillingBucket
+          TECHONE_SOAP_SECRET_NAME: !Sub "${EnvPrefix}/tech1/soap"
+          TECHONE_ADAPTOR_FUNCTION: !GetAtt TechoneBillingSOAPAdaptorFunction.Arn
+
+      Policies:
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - sqs:SendMessage
+          - sqs:GetQueueAttributes
+          - sqs:ReceiveMessage
+          - sqs:DeleteMessage
+          - sqs:DeleteMessageBatch
+          - sqs:GetQueueUrl
+          Resource: !GetAtt BillingQueue.Arn
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:*
+          Resource: "*"
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - secretsmanager:GetResourcePolicy
+          - secretsmanager:GetSecretValue
+          - secretsmanager:DescribeSecret
+          - secretsmanager:ListSecretVersionIds
+          Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - lambda:InvokeFunction
+          Resource: !GetAtt TechoneBillingSOAPAdaptorFunction.Arn
+
+      Events:
+        PublishQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BillingQueue.Arn
+            BatchSize: 1
+
+  TechoneBillingSOAPAdaptorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/techone_adaptor
+      Handler: c1_techone_soap_adaptor.lambda_handler
+      Runtime: python3.13
+      Architectures:
+      - x86_64
+      Timeout: 300
+
+      Environment:
+        Variables:
+          TECHONE_SOAP_SECRET_NAME: !Sub "${EnvPrefix}/tech1/soap"
+          TECHONE_BILLING_SOAP_ACTION_URL: !Sub "/${EnvPrefix}/b2/techone/billing_soap_action_url"
+          TECHONE_SECRET_NAME: !Sub "${EnvPrefix}/b2/techone_account_key"
+          TECHONE_API_ACCESS_TOKEN_URL: !Sub "/${EnvPrefix}/techone/accesstokenurl"
+
+      Policies:
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - secretsmanager:GetResourcePolicy
+          - secretsmanager:GetSecretValue
+          - secretsmanager:DescribeSecret
+          - secretsmanager:ListSecretVersionIds
+          Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+
+      - Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Action:
+          - ssm:GetParameter
+          - ssm:GetParameters
+          - ssm:DescribeParameters
+          Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+  BillingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${EnvPrefix}_Billing_Queue"
+      VisibilityTimeout: 900
+      ReceiveMessageWaitTimeSeconds: 0
+      DelaySeconds: 0
+      MessageRetentionPeriod: 1209600 #14 days
+      MaximumMessageSize: 262144
+
+  BillingDLQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${EnvPrefix}_Billing_Queue_DLQ"
+      MessageRetentionPeriod: 1209600 #14 days
+      ReceiveMessageWaitTimeSeconds: 0
+      VisibilityTimeout: 900 #Visibility Timeout value mentioned in Seconds
+      DelaySeconds: 0
+      MaximumMessageSize: 262144
+
+      RedriveAllowPolicy: { "redrivePermission": "byQueue", "sourceQueueArns": [ !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${EnvPrefix}_Billing_Queue" ] }
